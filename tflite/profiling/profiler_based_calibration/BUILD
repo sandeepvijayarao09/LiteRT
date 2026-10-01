@@ -9,18 +9,37 @@ package(
 )
 
 cc_library(
+    name = "tfl_dynamic_histogram",
+    srcs = ["tfl_dynamic_histogram.cc"],
+    hdrs = ["tfl_dynamic_histogram.h"],
+)
+
+cc_test(
+    name = "tfl_dynamic_histogram_test",
+    srcs = ["tfl_dynamic_histogram_test.cc"],
+    deps = [
+        ":tfl_dynamic_histogram",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "tfl_calibration_utils",
     srcs = ["tfl_calibration_utils.cc"],
     hdrs = ["tfl_calibration_utils.h"],
     deps = [
+        ":tfl_dynamic_histogram",
         ":tfl_tensor_stats_profiler",
         "//tflite:framework",
         "//tflite:stateful_error_reporter",
         "//tflite/c:common",
-        "//tflite/kernels:builtin_ops",
+        "//tflite/core:framework",
         "//tflite/profiling:memory_info",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
         "@eigen_archive//:eigen3",
     ],
 )
@@ -58,9 +77,14 @@ cc_test(
     deps = [
         ":tfl_calibration_utils",
         "//tflite:framework",
+        "//tflite:stateful_error_reporter",
+        "//tflite/c:common",
         "//tflite/profiling:memory_info",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_googletest//:gtest_main",
+        "@eigen_archive//:eigen3",
     ],
 )
 
@@ -71,9 +95,11 @@ pybind_extension(
     wrap_py_init = True,
     deps = [
         ":tfl_calibration_utils",
+        ":tfl_dynamic_histogram",
         "//tflite:framework",
         "//tflite:stateful_error_reporter",
         "//tflite/profiling:memory_info",
+        "@com_google_absl//absl/status:statusor",
         "@pybind11",
         "@xla//third_party/python_runtime:headers",
     ],
