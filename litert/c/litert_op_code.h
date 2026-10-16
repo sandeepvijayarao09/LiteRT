@@ -19,6 +19,7 @@
 extern "C" {
 #endif  // __cplusplus
 
+// LINT.IfChange(op_codes)
 typedef enum {
   kLiteRtOpCodeTflAdd = 0,               // kTfLiteBuiltinAdd
   kLiteRtOpCodeTflAveragePool2d = 1,     // kTfLiteBuiltinAveragePool2d
@@ -246,6 +247,7 @@ typedef enum {
   kLiteRtOpCodeShloCbrt = 208,         // kTfLiteBuiltinStablehloCbrt
   kLiteRtOpCodeShloCase = 209,         // kTfLiteBuiltinStablehloCase
 } LiteRtOpCode;
+// LINT.ThenChange(../python/litert_ir/_pywrap_litert_ir.cc:op_codes)
 
 #ifdef __cplusplus
 }
