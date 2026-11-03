@@ -13,8 +13,10 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
 import pathlib
 from typing import cast
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -234,6 +236,439 @@ class OctavQuantizeTest(parameterized.TestCase):
       self.assertTrue(np.all(quant_params.zero_point == 0))
       # See TFL_OP_TO_BLOCKWISE_WEIGHT_QUANTIZED_DIM.
       self.assertEqual(quant_params.quantized_dimension, 1)
+
+  def test_get_tensor_quant_params_int2_in_int4(self):
+    test_data = np.array(
+        [
+            [-1.5, -0.4, 0.4, 1.5, -0.9, 0.9, -0.1, 0.1],
+            [3.0, -3.0, 1.1, -1.1, 0.2, -0.2, 2.5, -2.5],
+        ],
+        dtype=np.float32,
+    )
+    tensor_config = qtyping.TensorQuantizationConfig(
+        num_bits=4,
+        symmetric=True,
+        granularity=qtyping.QuantGranularity.CHANNELWISE,
+        algorithm_params={"int2_in_int4": True},
+    )
+    fc_op_info = qtyping.OpInfo(
+        op=self._fc_op,
+        op_name=qtyping.TFLOperationName.FULLY_CONNECTED,
+        subgraph_op_index=self._subgraph_op_index,
+        op_quant_config=qtyping.OpQuantizationConfig(
+            weight_tensor_config=tensor_config,
+        ),
+    )
+    quant_params = octav.get_tensor_quant_params(
+        op_info=fc_op_info,
+        tensor_quant_config=tensor_config,
+        tensor_content=test_data,
+    )
+    self.assertEqual(quant_params.num_bits, 4)
+    self.assertEqual(quant_params.scale.dtype, np.float32)
+    np.testing.assert_array_equal(quant_params.zero_point, 0)
+    expected_scale = np.array([[6.0 / 17.0], [12.0 / 17.0]], dtype=np.float32)
+    np.testing.assert_allclose(
+        quant_params.scale, expected_scale, rtol=1e-6, atol=1e-6
+    )
+    q_data = cast(np.ndarray, quant_params.quantized_data)
+    expected_q = np.array(
+        [
+            [-3, -1, 1, 3, -3, 3, -1, 1],
+            [3, -3, 1, -1, 1, -1, 3, -3],
+        ],
+        dtype=np.int8,
+    )
+    np.testing.assert_array_equal(q_data, expected_q)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="int2_mid_tread",
+          bits=2,
+          mid_riser=False,
+          expected_half_steps=1,
+      ),
+      dict(
+          testcase_name="int4_mid_tread",
+          bits=4,
+          mid_riser=False,
+          expected_half_steps=7,
+      ),
+      dict(
+          testcase_name="int8_mid_tread",
+          bits=8,
+          mid_riser=False,
+          expected_half_steps=127,
+      ),
+      dict(
+          testcase_name="int2_mid_riser",
+          bits=2,
+          mid_riser=True,
+          expected_half_steps=2,
+      ),
+  )
+  def test_guess_clipping_with_octav_step_scaling(
+      self, bits: int, mid_riser: bool, expected_half_steps: int
+  ):
+    x = np.zeros(1000, dtype=np.float32)
+    x[0] = 2.0
+    kwargs = {"mid_riser": True} if mid_riser else {}
+    guess = octav._guess_clipping_with_octav(  # pylint: disable=protected-access
+        x,
+        bits=bits,
+        axis=0,
+        max_iterations=1,
+        exponent_divisor=3.0,
+        early_stop=False,
+        **kwargs,
+    )
+    alpha = np.float32(1.0 / (12.0 * (expected_half_steps**2)))
+    expected = np.float32(2.0) / (np.float32(1.0) + np.float32(999.0) * alpha)
+    np.testing.assert_allclose(guess, [expected], rtol=1e-6, atol=1e-6)
+
+  @parameterized.parameters(1, 0, -1)
+  def test_get_tensor_quant_params_rejects_num_bits_less_than_2(
+      self, invalid_bits: int
+  ):
+    test_data = np.array([[-1.0, 1.0], [0.5, -0.5]], dtype=np.float32)
+    tensor_config = qtyping.TensorQuantizationConfig(
+        num_bits=invalid_bits,
+        symmetric=True,
+        granularity=qtyping.QuantGranularity.CHANNELWISE,
+    )
+    fc_op_info = qtyping.OpInfo(
+        op=self._fc_op,
+        op_name=qtyping.TFLOperationName.FULLY_CONNECTED,
+        subgraph_op_index=self._subgraph_op_index,
+        op_quant_config=qtyping.OpQuantizationConfig(
+            weight_tensor_config=tensor_config,
+        ),
+    )
+    with self.assertRaisesRegex(ValueError, "num_bits >= 2"):
+      octav.get_tensor_quant_params(
+          op_info=fc_op_info,
+          tensor_quant_config=tensor_config,
+          tensor_content=test_data,
+      )
+
+  def test_guess_clipping_with_octav_rejects_invalid_bits(self):
+    x = np.array([1.0, -1.0], dtype=np.float32)
+    with self.assertRaisesRegex(ValueError, "bits >= 2"):
+      octav._guess_clipping_with_octav(  # pylint: disable=protected-access
+          x, bits=1, axis=0, max_iterations=1, exponent_divisor=3.0
+      )
+    with self.assertRaisesRegex(ValueError, "bits >= 1"):
+      octav._guess_clipping_with_octav(  # pylint: disable=protected-access
+          x,
+          bits=0,
+          axis=0,
+          max_iterations=1,
+          exponent_divisor=3.0,
+          mid_riser=True,
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="int8",
+          num_bits=8,
+          symmetric=True,
+          alg_params={"int2_in_int4": True},
+          err_regex="int2_in_int4",
+      ),
+      dict(
+          testcase_name="int2",
+          num_bits=2,
+          symmetric=True,
+          alg_params={"int2_in_int4": True},
+          err_regex="int2_in_int4",
+      ),
+      dict(
+          testcase_name="non_bool_flag",
+          num_bits=4,
+          symmetric=True,
+          alg_params={"int2_in_int4": "false"},
+          err_regex="int2_in_int4",
+      ),
+      dict(
+          testcase_name="asymmetric",
+          num_bits=4,
+          symmetric=False,
+          alg_params={"int2_in_int4": True},
+          err_regex="Unsupported symmetry|int2_in_int4",
+      ),
+  )
+  def test_get_tensor_quant_params_rejects_invalid_int2_in_int4(
+      self,
+      num_bits: int,
+      symmetric: bool,
+      alg_params: dict[str, object],
+      err_regex: str,
+  ):
+    test_data = np.array([[-1.0, 1.0], [0.5, -0.5]], dtype=np.float32)
+    tensor_config = qtyping.TensorQuantizationConfig(
+        num_bits=num_bits,
+        symmetric=symmetric,
+        granularity=qtyping.QuantGranularity.CHANNELWISE,
+        algorithm_params=alg_params,
+    )
+    fc_op_info = qtyping.OpInfo(
+        op=self._fc_op,
+        op_name=qtyping.TFLOperationName.FULLY_CONNECTED,
+        subgraph_op_index=self._subgraph_op_index,
+        op_quant_config=qtyping.OpQuantizationConfig(
+            weight_tensor_config=tensor_config,
+        ),
+    )
+    with self.assertRaisesRegex(ValueError, err_regex):
+      octav.get_tensor_quant_params(
+          op_info=fc_op_info,
+          tensor_quant_config=tensor_config,
+          tensor_content=test_data,
+      )
+
+  def test_get_tensor_quant_params_int2_in_int4_blockwise(self):
+    base_pattern = np.array(
+        [-1.5, -0.4, 0.4, 1.5, -0.9, 0.9, -0.1, 0.1], dtype=np.float32
+    )
+    blk_pos = np.tile(base_pattern, 4)
+    blk_neg = -blk_pos
+    # Shape (2, 64) with BLOCKWISE_32 -> (2, 2) blocks, including a large
+    # outlier block (2e5) that exceeds float16 max if scaled after rounding.
+    test_data = np.array(
+        [
+            np.concatenate(
+                [blk_pos * np.float32(1.37), blk_pos * np.float32(1.91)]
+            ),
+            np.concatenate(
+                [blk_neg * np.float32(2.13), blk_neg * np.float32(2e5)]
+            ),
+        ],
+        dtype=np.float32,
+    )
+    tensor_config = qtyping.TensorQuantizationConfig(
+        num_bits=4,
+        symmetric=True,
+        granularity=qtyping.QuantGranularity.BLOCKWISE_32,
+        algorithm_params={"int2_in_int4": True},
+    )
+    fc_op_info = qtyping.OpInfo(
+        op=self._fc_op,
+        op_name=qtyping.TFLOperationName.FULLY_CONNECTED,
+        subgraph_op_index=self._subgraph_op_index,
+        op_quant_config=qtyping.OpQuantizationConfig(
+            weight_tensor_config=tensor_config,
+        ),
+    )
+    quant_params = octav.get_tensor_quant_params(
+        op_info=fc_op_info,
+        tensor_quant_config=tensor_config,
+        tensor_content=test_data,
+    )
+    self.assertEqual(quant_params.num_bits, 4)
+    self.assertEqual(quant_params.block_size, 32)
+    self.assertEqual(quant_params.quantized_dimension, 1)
+    self.assertEqual(quant_params.scale.shape, (2, 2))
+    self.assertEqual(quant_params.scale.dtype, np.float32)
+    np.testing.assert_array_equal(quant_params.zero_point, 0)
+
+    # Analytical clip_val / 4 = (6 / 17) * mult (clamped to 65280 for 2e5),
+    # single-rounded to bfloat16 -> float16 -> float32.
+    expected_scale = np.array(
+        [[0.484375, 0.67578125], [0.75, 65280.0]], dtype=np.float32
+    )
+    np.testing.assert_array_equal(quant_params.scale, expected_scale)
+    self.assertTrue(np.all(np.isfinite(quant_params.scale.astype(np.float16))))
+
+    # Verify quant_params.scale is already invariant under bfloat16 -> float16
+    # FlatBuffer serialization rounding.
+    u32 = quant_params.scale.view(np.uint32)
+    bf16_u32 = (u32 + np.uint32(0x7FFF) + ((u32 >> 16) & np.uint32(1))) & (
+        np.uint32(0xFFFF0000)
+    )
+    serialized_scale = (
+        bf16_u32.view(np.float32).astype(np.float16).astype(np.float32)
+    )
+    np.testing.assert_array_equal(quant_params.scale, serialized_scale)
+
+    q_data = cast(np.ndarray, quant_params.quantized_data)
+    expected_q_pos = np.tile(
+        np.array([-3, -1, 1, 3, -3, 3, -1, 1], dtype=np.int8), 8
+    )
+    expected_q = np.stack([expected_q_pos, -expected_q_pos], axis=0)
+    np.testing.assert_array_equal(q_data, expected_q)
+
+  def test_get_tensor_quant_params_int2_in_int4_large_tensor_chunked(self):
+    # > 32 MiB float32 tensor (2050 * 4096 * 4 = 33,587,200 bytes) exercises
+    # the chunked quantization path in _quantize_int2_in_int4.
+    two_rows = np.array(
+        [
+            [-1.5, -0.4, 0.4, 1.5, -0.9, 0.9, -0.1, 0.1],
+            [3.0, -3.0, 1.1, -1.1, 0.2, -0.2, 2.5, -2.5],
+        ],
+        dtype=np.float32,
+    )
+    large_data = np.tile(two_rows, (1025, 512))
+    tensor_config = qtyping.TensorQuantizationConfig(
+        num_bits=4,
+        symmetric=True,
+        granularity=qtyping.QuantGranularity.CHANNELWISE,
+        algorithm_params={"int2_in_int4": True},
+    )
+    fc_op_info = qtyping.OpInfo(
+        op=self._fc_op,
+        op_name=qtyping.TFLOperationName.FULLY_CONNECTED,
+        subgraph_op_index=self._subgraph_op_index,
+        op_quant_config=qtyping.OpQuantizationConfig(
+            weight_tensor_config=tensor_config,
+        ),
+    )
+    large_params = octav.get_tensor_quant_params(
+        op_info=fc_op_info,
+        tensor_quant_config=tensor_config,
+        tensor_content=large_data,
+    )
+    expected_two_scales = np.array(
+        [[6.0 / 17.0], [12.0 / 17.0]], dtype=np.float32
+    )
+    np.testing.assert_allclose(
+        large_params.scale,
+        np.tile(expected_two_scales, (1025, 1)),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    large_q = cast(np.ndarray, large_params.quantized_data)
+    expected_two_q = np.array(
+        [
+            [-3, -1, 1, 3, -3, 3, -1, 1],
+            [3, -3, 1, -1, 1, -1, 3, -3],
+        ],
+        dtype=np.int8,
+    )
+    np.testing.assert_array_equal(large_q, np.tile(expected_two_q, (1025, 512)))
+
+  def test_quantize_int2_in_int4_chunked_higher_rank_matches_unchunked(self):
+    rng = np.random.default_rng(123)
+    for shape, q_dim, num_channels in [
+        ((3, 4, 5, 8), 0, 3),
+        ((2, 6, 8), 2, 8),
+    ]:
+      data = rng.uniform(-3.0, 3.0, size=shape).astype(np.float32)
+      scales = np.linspace(0.25, 1.25, num=num_channels, dtype=np.float32)
+      quant_params = qtyping.UniformQuantParams(
+          scale=scales,
+          zero_point=np.zeros(num_channels, dtype=np.int32),
+          num_bits=4,
+          symmetric=True,
+          quantized_dimension=q_dim,
+      )
+      # pylint: disable-next=protected-access
+      unchunked = octav._quantize_int2_in_int4(data, quant_params)
+      with mock.patch.object(octav, "_CHUNK_BYTES", 128):
+        # pylint: disable-next=protected-access
+        chunked = octav._quantize_int2_in_int4(data, quant_params)
+      np.testing.assert_array_equal(chunked, unchunked)
+
+  @parameterized.product(
+      distribution=["gaussian", "laplace"],
+      num_bits=[2, 4],
+  )
+  def test_continuous_weights_mid_tread_beats_legacy_and_min_max(
+      self, distribution: str, num_bits: int
+  ):
+    rng = np.random.default_rng(2026)
+    channel_scales = rng.uniform(0.5, 1.5, size=(64, 1)).astype(np.float32)
+    if distribution == "gaussian":
+      base_weights = rng.normal(0.0, 0.25, size=(64, 1024)).astype(np.float32)
+    else:
+      base_weights = rng.laplace(0.0, 0.2, size=(64, 1024)).astype(np.float32)
+    weights = base_weights * channel_scales
+
+    tensor_config = qtyping.TensorQuantizationConfig(
+        num_bits=num_bits,
+        symmetric=True,
+        granularity=qtyping.QuantGranularity.CHANNELWISE,
+    )
+    fc_op_info = qtyping.OpInfo(
+        op=self._fc_op,
+        op_name=qtyping.TFLOperationName.FULLY_CONNECTED,
+        subgraph_op_index=self._subgraph_op_index,
+        op_quant_config=qtyping.OpQuantizationConfig(
+            weight_tensor_config=tensor_config,
+        ),
+    )
+
+    # True mid-tread OCTAV: M = 2^(B-1) - 1 (noise weight 1/12 for INT2,
+    # 1/588 for INT4).
+    mid_tread_params = octav.get_tensor_quant_params(
+        op_info=fc_op_info,
+        tensor_quant_config=tensor_config,
+        tensor_content=weights,
+    )
+    mid_tread_dequant = (
+        cast(np.ndarray, mid_tread_params.quantized_data)
+        * mid_tread_params.scale
+    )
+
+    # Legacy OCTAV step scaling on the same mid-tread integer grid:
+    # M = 2^(B-1) (noise weight 1/48 for INT2, 1/768 for INT4).
+    orig_guess = octav._guess_clipping_with_octav  # pylint: disable=protected-access
+    with mock.patch.object(
+        octav,
+        "_guess_clipping_with_octav",
+        side_effect=lambda *args, **kwargs: orig_guess(
+            *args, **(kwargs | {"mid_riser": True})
+        ),
+    ):
+      legacy_params = octav.get_tensor_quant_params(
+          op_info=fc_op_info,
+          tensor_quant_config=tensor_config,
+          tensor_content=weights,
+      )
+    legacy_dequant = (
+        cast(np.ndarray, legacy_params.quantized_data) * legacy_params.scale
+    )
+
+    # Naive min-max on the same mid-tread integer grid: scale = max|w| / M.
+    qmax = (1 << (num_bits - 1)) - 1
+    qmin = -(1 << (num_bits - 1))
+    min_max_scale = np.max(np.abs(weights), axis=1, keepdims=True) / np.float32(
+        qmax
+    )
+    min_max_dequant = (
+        np.clip(np.rint(weights / min_max_scale), qmin, qmax) * min_max_scale
+    )
+
+    weights_f64 = weights.astype(np.float64)
+    mid_tread_mse = float(
+        np.mean((mid_tread_dequant.astype(np.float64) - weights_f64) ** 2)
+    )
+    legacy_mse = float(
+        np.mean((legacy_dequant.astype(np.float64) - weights_f64) ** 2)
+    )
+    min_max_mse = float(
+        np.mean((min_max_dequant.astype(np.float64) - weights_f64) ** 2)
+    )
+
+    logging.info(
+        "Continuous %s INT%d MSE: mid_tread=%.6e, legacy=%.6e, min_max=%.6e",
+        distribution,
+        num_bits,
+        mid_tread_mse,
+        legacy_mse,
+        min_max_mse,
+    )
+    self.assertLess(
+        mid_tread_mse,
+        legacy_mse,
+        f"Expected mid-tread MSE ({mid_tread_mse:.6e}) < legacy"
+        f" ({legacy_mse:.6e}) for {distribution} INT{num_bits}.",
+    )
+    self.assertLess(
+        legacy_mse,
+        min_max_mse,
+        f"Expected legacy MSE ({legacy_mse:.6e}) < min-max"
+        f" ({min_max_mse:.6e}) for {distribution} INT{num_bits}.",
+    )
 
 
 if __name__ == "__main__":
