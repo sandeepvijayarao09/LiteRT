@@ -298,7 +298,8 @@ TEST(TensorRtBytecodeTest, SharedWeightShardRejectsInvalidReferences) {
 }
 
 // A store with a private run, a segment of two pieces, a gap and a second
-// segment, for an engine whose weight data is five granules.
+// segment, for an engine whose weight data is five granules. The second run
+// reads the first four bytes of `run_data`, so it must hold at least four.
 TensorRtWeightStore MakeWeightStore(const std::vector<uint8_t>& run_data) {
   constexpr uint64_t kGranule = 2 << 20;
   TensorRtWeightStore store;
@@ -390,7 +391,7 @@ TEST(TensorRtBytecodeTest, WeightStoreRoundTripsInAShard) {
 }
 
 TEST(TensorRtBytecodeTest, StepFeedRoundTripsInAShardAsVersionSeven) {
-  const std::vector<uint8_t> run_data = {1, 2, 3};
+  const std::vector<uint8_t> run_data = {1, 2, 3, 4};
   const TensorRtWeightStore store = MakeWeightStore(run_data);
   const std::vector<uint8_t> engine = {4, 5};
   // Three rows' FP32 scales as little-endian bytes.
@@ -475,7 +476,7 @@ TEST(TensorRtBytecodeTest, StepFeedRoundTripsInAShardAsVersionSeven) {
 }
 
 TEST(TensorRtBytecodeTest, StepFeedWithoutATableRoundTrips) {
-  const std::vector<uint8_t> run_data = {1, 2, 3};
+  const std::vector<uint8_t> run_data = {1, 2, 3, 4};
   const TensorRtWeightStore store = MakeWeightStore(run_data);
   const std::vector<uint8_t> engine = {4, 5};
   TensorRtStepFeed feed;
