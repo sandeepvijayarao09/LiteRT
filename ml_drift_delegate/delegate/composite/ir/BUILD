@@ -50,6 +50,7 @@ cc_library(
         "//ml_drift_delegate/tflite:custom_ir_operation_parser",
         "//ml_drift_delegate/tflite:ir_model_builder_helper",
         "//ml_drift_delegate/tflite:model_builder_helper",
+        "//ml_drift_delegate/tflite/convert:convert_aux",
         "//tflite:builtin_ops",
         "//tflite/c:common",
         "//tflite/kernels:kernel_util",
@@ -264,11 +265,16 @@ cc_library(
         "@ml_drift//ml_drift/common:ir_model",
         "@ml_drift//ml_drift/common:ir_model_util",
         "@ml_drift//ml_drift/common:model",
+        "@ml_drift//ml_drift/common:model_hints",
         "@ml_drift//ml_drift/common:operations",
+        "@ml_drift//ml_drift/common:shape",
+        "@ml_drift//ml_drift/common:tensor",
+        "@ml_drift//ml_drift/common/kernels:fully_connected",
         "@ml_drift//ml_drift/common/selectors:operation_selector",
         "@ml_drift//ml_drift/common/selectors:special_selector",
         "@ml_drift//ml_drift/common/task:gpu_operation",
         "@ml_drift//ml_drift/common/task:tensor_desc",
+        "@ml_drift//ml_drift/common/task:weights_layout",
     ],
 )
 
@@ -324,6 +330,9 @@ cc_test(
     deps = [
         ":moe_experts_parser",
         "//ml_drift_delegate/tflite:custom_ir_operation_parser",
+        "//ml_drift_delegate/tflite:ir_model_builder",
+        "//ml_drift_delegate/tflite:ir_model_builder_helper",
+        "//ml_drift_delegate/tflite:shared_const_tensor_map",
         "//ml_drift_delegate/tflite/convert:convert_testing_utils",
         "//ml_drift_delegate/tflite/convert:stub_delegate",
         "//tflite:builtin_ops",
@@ -333,6 +342,7 @@ cc_test(
         "@com_google_googletest//:gtest_main",
         "@flatbuffers",
         "@ml_drift//ml_drift/common:ir_model",
+        "@ml_drift//ml_drift/common:operations",
     ],
 )
 
