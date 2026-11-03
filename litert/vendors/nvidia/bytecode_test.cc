@@ -325,6 +325,44 @@ TensorRtWeightStore MakeWeightStore(const std::vector<uint8_t>& run_data) {
   return store;
 }
 
+#ifdef _WIN32
+TEST(TensorRtBytecodeTest, WindowsAbsolutePathsRoundTrip) {
+  const std::vector<uint8_t> run_data = {1, 2, 3, 4, 5, 6, 7};
+  const std::vector<uint8_t> engine = {9, 8, 7};
+  for (const std::string path :
+       {"C:/models/gemma.litertlm", R"(\\?\C:\models\gemma.litertlm)",
+        "//?/C:/models/gemma.litertlm", R"(\\server\share\gemma.litertlm)"}) {
+    auto store = MakeWeightStore(run_data);
+    store.source_path = path;
+    TensorRtBundleEntry entry;
+    entry.function_name = "partition_0";
+    entry.input_names = {"input"};
+    entry.output_names = {"output"};
+    entry.engine_data = engine.data();
+    entry.engine_size = engine.size();
+    entry.weight_store = &store;
+    auto shard = PackTensorRtSharedWeightShard({}, entry);
+    ASSERT_TRUE(shard.HasValue()) << shard.Error().Message();
+    auto parsed =
+        ParseTensorRtBytecode(shard->data(), shard->size(), "partition_0");
+    ASSERT_TRUE(parsed.HasValue()) << parsed.Error().Message();
+    ASSERT_TRUE(parsed->weight_store.has_value());
+    EXPECT_EQ(parsed->weight_store->source_path, path);
+    TensorRtAotLocator locator{path, 123, {7, 11}};
+    auto packed = PackTensorRtAotLocator(locator);
+    ASSERT_TRUE(packed.HasValue()) << packed.Error().Message();
+    auto restored = TryParseTensorRtAotLocator(packed->data(), packed->size());
+    ASSERT_TRUE(restored.HasValue()) << restored.Error().Message();
+    ASSERT_TRUE(restored->has_value());
+    EXPECT_EQ(restored->value().path, path);
+  }
+  EXPECT_FALSE(
+      PackTensorRtAotLocator({"relative/file.bin", 1, {2, 3}}).HasValue());
+  EXPECT_FALSE(
+      PackTensorRtAotLocator({"C:relative.bin", 1, {2, 3}}).HasValue());
+}
+#endif
+
 TEST(TensorRtBytecodeTest, WeightStoreRoundTripsInAShard) {
   const std::vector<uint8_t> run_data = {1, 2, 3, 4, 5, 6, 7};
   const TensorRtWeightStore store = MakeWeightStore(run_data);
