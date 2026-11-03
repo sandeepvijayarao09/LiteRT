@@ -1,0 +1,524 @@
+// Copyright 2026 Google LLC.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "litert/tools/imagenet_eval_data.h"
+
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <ios>
+#include <limits>
+#include <memory>
+#include <numeric>
+#include <set>
+#include <sstream>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "litert/c/litert_common.h"
+#include "litert/c/litert_model_types.h"
+#include "litert/cc/litert_expected.h"
+#include "litert/cc/litert_macros.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"  // from @stblib
+
+namespace litert::imagenet {
+namespace {
+uint32_t Ror(uint32_t x, unsigned n) { return (x >> n) | (x << (32 - n)); }
+constexpr uint64_t kImageLimit = 256ULL * 1024 * 1024;
+Expected<void> Require(bool condition, const std::string& message) {
+  if (!condition) return Error(kLiteRtStatusErrorInvalidArgument, message);
+  return {};
+}
+}  // namespace
+
+void Sha256::Block(const uint8_t* p) {
+  static constexpr uint32_t k[64] = {
+      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+      0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+      0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+      0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+      0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+      0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+      0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+      0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+      0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+  uint32_t w[64];
+  for (int i = 0; i < 16; ++i)
+    w[i] = static_cast<uint32_t>(p[4 * i]) << 24 |
+           static_cast<uint32_t>(p[4 * i + 1]) << 16 |
+           static_cast<uint32_t>(p[4 * i + 2]) << 8 |
+           static_cast<uint32_t>(p[4 * i + 3]);
+  for (int i = 16; i < 64; ++i) {
+    auto x = w[i - 15], y = w[i - 2];
+    w[i] = w[i - 16] + (Ror(x, 7) ^ Ror(x, 18) ^ (x >> 3)) + w[i - 7] +
+           (Ror(y, 17) ^ Ror(y, 19) ^ (y >> 10));
+  }
+  auto a = state_[0], b = state_[1], c = state_[2], d = state_[3];
+  auto e = state_[4], f = state_[5], g = state_[6], h = state_[7];
+  for (int i = 0; i < 64; ++i) {
+    uint32_t t1 = h + (Ror(e, 6) ^ Ror(e, 11) ^ Ror(e, 25)) +
+                  ((e & f) ^ (~e & g)) + k[i] + w[i];
+    uint32_t t2 =
+        (Ror(a, 2) ^ Ror(a, 13) ^ Ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+    h = g;
+    g = f;
+    f = e;
+    e = d + t1;
+    d = c;
+    c = b;
+    b = a;
+    a = t1 + t2;
+  }
+  state_[0] += a;
+  state_[1] += b;
+  state_[2] += c;
+  state_[3] += d;
+  state_[4] += e;
+  state_[5] += f;
+  state_[6] += g;
+  state_[7] += h;
+}
+void Sha256::Update(const void* raw, size_t size) {
+  const auto* data = static_cast<const uint8_t*>(raw);
+  // SHA-256 encodes the bit length modulo 2^64.
+  bytes_ += size;
+  while (size) {
+    size_t n = std::min(size, pending_.size() - used_);
+    std::memcpy(pending_.data() + used_, data, n);
+    used_ += n;
+    data += n;
+    size -= n;
+    if (used_ == 64) {
+      Block(pending_.data());
+      used_ = 0;
+    }
+  }
+}
+std::string Sha256::Hex() const {
+  Sha256 copy = *this;
+  uint64_t bits = bytes_ * 8;
+  uint8_t tail[128]{};
+  tail[0] = 0x80;
+  size_t padding = used_ < 56 ? 56 - used_ : 120 - used_;
+  for (int i = 0; i < 8; ++i) tail[padding + i] = bits >> (56 - i * 8);
+  copy.Update(tail, padding + 8);
+  std::ostringstream out;
+  out << std::hex << std::setfill('0');
+  for (auto word : copy.state_) out << std::setw(8) << word;
+  return out.str();
+}
+std::string HashBytes(const void* data, size_t size) {
+  Sha256 hash;
+  hash.Update(data, size);
+  return hash.Hex();
+}
+Expected<std::string> HashFile(const std::string& path) {
+  std::ifstream input(path, std::ios::binary);
+  LITERT_RETURN_IF_ERROR(Require(static_cast<bool>(input),
+                                 "Cannot open file for hashing: " + path));
+  std::array<char, 65536> buffer;
+  Sha256 hash;
+  while (input) {
+    input.read(buffer.data(), buffer.size());
+    hash.Update(buffer.data(), input.gcount());
+  }
+  LITERT_RETURN_IF_ERROR(Require(input.eof(), "Failed to read file: " + path));
+  return hash.Hex();
+}
+Expected<Json> ReadJson(const std::string& path) {
+  std::ifstream in(path);
+  LITERT_RETURN_IF_ERROR(
+      Require(static_cast<bool>(in), "Cannot open JSON: " + path));
+  auto value = Json::parse(in, nullptr, false);
+  LITERT_RETURN_IF_ERROR(
+      Require(!value.is_discarded(), "Invalid JSON: " + path));
+  return value;
+}
+Expected<void> WriteJson(const std::string& path, const Json& value) {
+  std::ofstream out(path);
+  LITERT_RETURN_IF_ERROR(
+      Require(static_cast<bool>(out), "Cannot open JSON output: " + path));
+  out << value.dump(2, ' ', false, Json::error_handler_t::replace) << '\n';
+  out.flush();
+  LITERT_RETURN_IF_ERROR(
+      Require(static_cast<bool>(out), "Failed to write JSON: " + path));
+  return {};
+}
+
+Expected<std::vector<Sample>> ReadSamples(const std::string& manifest,
+                                          const std::string& image_root,
+                                          int start, int limit) {
+  LITERT_RETURN_IF_ERROR(
+      Require(start >= 0 && limit >= 0, "Negative sample range"));
+  std::ifstream file(manifest);
+  LITERT_RETURN_IF_ERROR(
+      Require(static_cast<bool>(file), "Cannot open manifest: " + manifest));
+  std::vector<Sample> rows;
+  std::set<int> ids;
+  std::string line;
+  bool first = true;
+  const auto root = image_root.empty()
+                        ? std::filesystem::path(manifest).parent_path()
+                        : std::filesystem::path(image_root);
+  auto integer = [](const std::string& text, int& value) {
+    const auto parsed =
+        std::from_chars(text.data(), text.data() + text.size(), value);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+  };
+  while (std::getline(file, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty() || line[0] == '#') continue;
+    if (first && line == "id\tlabel\tpath") {
+      first = false;
+      continue;
+    }
+    first = false;
+    const auto tab = line.find('\t');
+    const auto second =
+        tab == std::string::npos ? tab : line.find('\t', tab + 1);
+    LITERT_RETURN_IF_ERROR(
+        Require(second != std::string::npos &&
+                    line.find('\t', second + 1) == std::string::npos,
+                "Bad manifest row: " + line));
+    Sample row{};
+    LITERT_RETURN_IF_ERROR(
+        Require(integer(line.substr(0, tab), row.id) &&
+                    integer(line.substr(tab + 1, second - tab - 1), row.label),
+                "Invalid manifest ID or label: " + line));
+    row.path = line.substr(second + 1);
+    LITERT_RETURN_IF_ERROR(
+        Require(!row.path.empty() && ids.insert(row.id).second,
+                "Empty image path or duplicate sample ID"));
+    row.path = (root / row.path).string();
+    rows.push_back(std::move(row));
+  }
+  LITERT_RETURN_IF_ERROR(
+      Require(file.eof(), "Failed to read manifest: " + manifest));
+  LITERT_RETURN_IF_ERROR(
+      Require(static_cast<size_t>(start) < rows.size(), "No selected samples"));
+  rows.erase(rows.begin(), rows.begin() + start);
+  if (limit && static_cast<size_t>(limit) < rows.size()) rows.resize(limit);
+  return rows;
+}
+
+namespace {
+template <typename Actual, typename Reference>
+Expected<Comparison> CompareElements(size_t count, Actual actual,
+                                     Reference reference, bool floating,
+                                     double atol, double rtol, double max_code,
+                                     double mean_code) {
+  LITERT_RETURN_IF_ERROR(Require(count > 0, "Cannot compare empty tensor"));
+  for (double tolerance : {atol, rtol, max_code, mean_code}) {
+    LITERT_RETURN_IF_ERROR(
+        Require(std::isfinite(tolerance) && tolerance >= 0,
+                "Tolerances must be finite and nonnegative"));
+  }
+  Comparison out;
+  for (size_t i = 0; i < count; ++i) {
+    const double a = actual(i), b = reference(i);
+    const double delta = std::abs(a - b);
+    out.finite &= std::isfinite(a) && std::isfinite(b);
+    out.max_abs = std::max(out.max_abs, delta);
+    out.mean_abs += delta;
+    out.allclose &= delta <= atol + rtol * std::abs(b);
+  }
+  out.mean_abs /= count;
+  out.allclose = out.finite && (floating ? out.allclose
+                                         : out.max_abs <= max_code &&
+                                               out.mean_abs <= mean_code);
+  return out;
+}
+}  // namespace
+
+Expected<Comparison> CompareTensorValues(const void* actual,
+                                         const void* reference, size_t count,
+                                         bool floating, double atol,
+                                         double rtol, double max_code,
+                                         double mean_code) {
+  LITERT_RETURN_IF_ERROR(Require(actual && reference, "Missing tensor data"));
+  return CompareElements(
+      count,
+      [&](size_t i) -> double {
+        return floating ? static_cast<const float*>(actual)[i]
+                        : static_cast<const int8_t*>(actual)[i];
+      },
+      [&](size_t i) -> double {
+        return floating ? static_cast<const float*>(reference)[i]
+                        : static_cast<const int8_t*>(reference)[i];
+      },
+      floating, atol, rtol, max_code, mean_code);
+}
+
+Expected<Comparison> CompareScores(const std::vector<float>& actual,
+                                   const std::vector<float>& reference,
+                                   double atol, double rtol) {
+  LITERT_RETURN_IF_ERROR(
+      Require(actual.size() == reference.size(), "Output size mismatch"));
+  LITERT_ASSIGN_OR_RETURN(
+      auto result, CompareTensorValues(actual.data(), reference.data(),
+                                       actual.size(), true, atol, rtol, 0, 0));
+  LITERT_RETURN_IF_ERROR(Require(result.finite, "Nonfinite output score"));
+  return result;
+}
+
+Expected<Comparison> CompareQuantizedScores(
+    const std::vector<float>& actual, const std::vector<float>& reference,
+    const LiteRtQuantizationPerTensor& quantization, double max_code,
+    double mean_code) {
+  LITERT_RETURN_IF_ERROR(
+      Require(actual.size() == reference.size(), "Output size mismatch"));
+  LITERT_RETURN_IF_ERROR(
+      Require(std::isfinite(quantization.scale) && quantization.scale > 0,
+              "Invalid quantization scale"));
+  // Recover integer output codes from dequantized scores. This is distinct
+  // from quantizing FP32 model inputs; these values already represent codes.
+  return CompareElements(
+      actual.size(),
+      [&](size_t i) {
+        return std::round(actual[i] / quantization.scale +
+                          quantization.zero_point);
+      },
+      [&](size_t i) {
+        return std::round(reference[i] / quantization.scale +
+                          quantization.zero_point);
+      },
+      false, 0, 0, max_code, mean_code);
+}
+Expected<std::vector<int>> TopK(const std::vector<float>& scores, int k) {
+  LITERT_RETURN_IF_ERROR(
+      Require(k >= 0 && std::all_of(scores.begin(), scores.end(),
+                                    [](float f) { return std::isfinite(f); }),
+              "Invalid top-k scores"));
+  std::vector<int> indices(scores.size());
+  std::iota(indices.begin(), indices.end(), 0);
+  std::partial_sort(
+      indices.begin(),
+      indices.begin() + std::min(static_cast<size_t>(k), indices.size()),
+      indices.end(), [&](int a, int b) {
+        return scores[a] > scores[b] || (scores[a] == scores[b] && a < b);
+      });
+  indices.resize(std::min(static_cast<size_t>(k), indices.size()));
+  return indices;
+}
+
+Expected<void> ValidatePreprocessing(const Preprocessing& c) {
+  LITERT_RETURN_IF_ERROR(
+      Require(c.interpolation == "bilinear" || c.interpolation == "bicubic",
+              "Unknown interpolation"));
+  LITERT_RETURN_IF_ERROR(Require(
+      c.resize > 0 && c.resize <= 65536 && c.crop_h > 0 && c.crop_w > 0 &&
+          static_cast<uint64_t>(c.crop_h) * c.crop_w * 3 * sizeof(float) <=
+              kImageLimit,
+      "Invalid resize/crop dimensions"));
+  for (int i = 0; i < 3; ++i)
+    LITERT_RETURN_IF_ERROR(Require(std::isfinite(c.mean[i]) &&
+                                       std::isfinite(c.stddev[i]) &&
+                                       c.stddev[i] > 0,
+                                   "Invalid normalization parameters"));
+  return {};
+}
+Expected<Preprocessing> ParsePreprocessing(const Json& value) {
+  const auto& j = value.is_object() && value.contains("preprocessing")
+                      ? value["preprocessing"]
+                      : value;
+  LITERT_RETURN_IF_ERROR(
+      Require(j.is_object(), "Preprocessing must be an object"));
+  if (j.contains("profile"))
+    LITERT_RETURN_IF_ERROR(
+        Require(j["profile"].is_string() && j["profile"] == "torchvision",
+                "Only native TorchVision preprocessing is supported"));
+  for (const char* key : {"resize", "crop_h", "crop_w"}) {
+    LITERT_RETURN_IF_ERROR(
+        Require(j.contains(key) && j[key].is_number_integer(),
+                std::string("Expected integer: ") + key));
+    const double v = j[key].get<double>();
+    LITERT_RETURN_IF_ERROR(
+        Require(v > 0 && v <= 65536, "Invalid resize/crop dimensions"));
+  }
+  LITERT_RETURN_IF_ERROR(
+      Require(j.contains("interpolation") && j["interpolation"].is_string() &&
+                  j.contains("antialias") && j["antialias"].is_boolean(),
+              "Invalid interpolation or antialias value"));
+  Preprocessing c;
+  c.interpolation = j["interpolation"].get<std::string>();
+  c.resize = j["resize"].get<int>();
+  c.crop_h = j["crop_h"].get<int>();
+  c.crop_w = j["crop_w"].get<int>();
+  c.antialias = j["antialias"].get<bool>();
+  for (const char* key : {"mean", "std"}) {
+    LITERT_RETURN_IF_ERROR(
+        Require(j.contains(key) && j[key].is_array() && j[key].size() == 3,
+                std::string("Expected three numbers: ") + key));
+    for (int i = 0; i < 3; ++i) {
+      LITERT_RETURN_IF_ERROR(
+          Require(j[key][i].is_number(), "Invalid normalization value"));
+      double v = j[key][i].get<double>();
+      LITERT_RETURN_IF_ERROR(Require(
+          std::isfinite(v) && std::abs(v) <= std::numeric_limits<float>::max(),
+          "Normalization value out of range"));
+      (std::string(key) == "mean" ? c.mean : c.stddev)[i] =
+          static_cast<float>(v);
+    }
+  }
+  LITERT_RETURN_IF_ERROR(ValidatePreprocessing(c));
+  return c;
+}
+Json DescribePreprocessing(const Preprocessing& c) {
+  return {{"profile", "torchvision"}, {"interpolation", c.interpolation},
+          {"resize", c.resize},       {"crop_h", c.crop_h},
+          {"crop_w", c.crop_w},       {"antialias", c.antialias},
+          {"mean", c.mean},           {"std", c.stddev}};
+}
+Expected<std::array<int, 2>> ResizedDimensions(int w, int h,
+                                               const Preprocessing& c) {
+  LITERT_RETURN_IF_ERROR(ValidatePreprocessing(c));
+  LITERT_RETURN_IF_ERROR(
+      Require(w > 0 && h > 0 && static_cast<uint64_t>(w) * h * 3 <= kImageLimit,
+              "Invalid decoded image dimensions"));
+  double longer =
+      static_cast<double>(std::max(w, h)) * c.resize / std::min(w, h);
+  LITERT_RETURN_IF_ERROR(Require(longer >= 1 && longer <= 65536,
+                                 "Resized image dimension exceeds limit"));
+  return w < h ? std::array<int, 2>{c.resize, static_cast<int>(longer)}
+               : std::array<int, 2>{static_cast<int>(longer), c.resize};
+}
+Expected<int> CropOffset(int d) {
+  LITERT_RETURN_IF_ERROR(Require(d >= 0, "Crop exceeds resized image"));
+  // Python round() uses ties-to-even, independent of the process rounding mode.
+  return d / 2 + ((d % 2) && ((d / 2) % 2));
+}
+Expected<std::vector<uint8_t>> ResizeRgb(const uint8_t* src, int w, int h,
+                                         int ow, int oh,
+                                         const Preprocessing& c) {
+  LITERT_RETURN_IF_ERROR(ValidatePreprocessing(c));
+  LITERT_RETURN_IF_ERROR(Require(
+      src && w > 0 && h > 0 && ow > 0 && oh > 0 &&
+          static_cast<uint64_t>(w) * h * 3 <= kImageLimit &&
+          static_cast<uint64_t>(ow) * h * 3 * sizeof(float) <= kImageLimit &&
+          static_cast<uint64_t>(ow) * oh * 3 <= kImageLimit,
+      "Resize exceeds image allocation limit"));
+  struct Coefficients {
+    int first;
+    std::vector<double> weights;
+  };
+  auto coefficients = [&](int input,
+                          int output) -> Expected<std::vector<Coefficients>> {
+    std::vector<Coefficients> result(output);
+    double scale = static_cast<double>(input) / output;
+    double filter_scale = c.antialias ? std::max(1.0, scale) : 1.0;
+    double support = (c.interpolation == "bicubic" ? 2.0 : 1.0) * filter_scale;
+    for (int x = 0; x < output; ++x) {
+      double center = (x + 0.5) * scale;
+      int first = std::max(0, static_cast<int>(center - support + 0.5));
+      int last = std::min(input, static_cast<int>(center + support + 0.5));
+      Coefficients entry{first, {}};
+      double total = 0;
+      for (int i = first; i < last; ++i) {
+        double v = std::abs((i - center + 0.5) / filter_scale);
+        double weight;
+        if (c.interpolation == "bilinear")
+          weight = std::max(0.0, 1.0 - v);
+        else if (v < 1)
+          weight = ((1.5 * v - 2.5) * v) * v + 1;
+        else if (v < 2)
+          weight = ((-0.5 * v + 2.5) * v - 4) * v + 2;
+        else
+          weight = 0;
+        entry.weights.push_back(weight);
+        total += weight;
+      }
+      LITERT_RETURN_IF_ERROR(Require(total != 0, "Empty resize filter"));
+      for (auto& weight : entry.weights) weight /= total;
+      result[x] = std::move(entry);
+    }
+    return result;
+  };
+  LITERT_ASSIGN_OR_RETURN(auto xs, coefficients(w, ow));
+  LITERT_ASSIGN_OR_RETURN(auto ys, coefficients(h, oh));
+  auto pixel = [](double x) {
+    return static_cast<uint8_t>(std::clamp(std::floor(x + 0.5), 0.0, 255.0));
+  };
+  // PIL's RGB image pipeline rounds/clamps the horizontal pass to uint8.
+  std::vector<uint8_t> tmp(static_cast<size_t>(ow) * h * 3),
+      out(static_cast<size_t>(ow) * oh * 3);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < ow; ++x)
+      for (int ch = 0; ch < 3; ++ch) {
+        double v = 0;
+        const auto& k = xs[x];
+        for (size_t i = 0; i < k.weights.size(); ++i)
+          v += k.weights[i] *
+               src[(static_cast<size_t>(y) * w + k.first + i) * 3 + ch];
+        tmp[(static_cast<size_t>(y) * ow + x) * 3 + ch] = pixel(v);
+      }
+  for (int y = 0; y < oh; ++y)
+    for (int x = 0; x < ow; ++x)
+      for (int ch = 0; ch < 3; ++ch) {
+        double v = 0;
+        const auto& k = ys[y];
+        for (size_t i = 0; i < k.weights.size(); ++i)
+          v += k.weights[i] * tmp[((k.first + i) * ow + x) * 3 + ch];
+        out[(static_cast<size_t>(y) * ow + x) * 3 + ch] = pixel(v);
+      }
+  return out;
+}
+Expected<std::vector<float>> PreprocessRgb(const uint8_t* src, int w, int h,
+                                           const Preprocessing& c, bool nchw) {
+  LITERT_ASSIGN_OR_RETURN(auto dims, ResizedDimensions(w, h, c));
+  LITERT_ASSIGN_OR_RETURN(auto rgb, ResizeRgb(src, w, h, dims[0], dims[1], c));
+  int padded_w = std::max(dims[0], c.crop_w),
+      padded_h = std::max(dims[1], c.crop_h);
+  int pad_left = (padded_w - dims[0]) / 2, pad_top = (padded_h - dims[1]) / 2;
+  LITERT_ASSIGN_OR_RETURN(int left, CropOffset(padded_w - c.crop_w));
+  LITERT_ASSIGN_OR_RETURN(int top, CropOffset(padded_h - c.crop_h));
+  left -= pad_left;
+  top -= pad_top;
+  std::vector<float> out(static_cast<size_t>(c.crop_w) * c.crop_h * 3);
+  for (int y = 0; y < c.crop_h; ++y)
+    for (int x = 0; x < c.crop_w; ++x)
+      for (int ch = 0; ch < 3; ++ch) {
+        int sx = x + left, sy = y + top;
+        float p = (sx >= 0 && sx < dims[0] && sy >= 0 && sy < dims[1])
+                      ? rgb[(static_cast<size_t>(sy) * dims[0] + sx) * 3 + ch]
+                      : 0;
+        float v = (p / 255.0f - c.mean[ch]) / c.stddev[ch];
+        size_t index =
+            nchw ? (static_cast<size_t>(ch) * c.crop_h + y) * c.crop_w + x
+                 : (static_cast<size_t>(y) * c.crop_w + x) * 3 + ch;
+        out[index] = v;
+      }
+  return out;
+}
+Expected<std::vector<float>> DecodePreprocess(const std::string& path,
+                                              const Preprocessing& c,
+                                              bool nchw) {
+  int w, h, channels;
+  auto* data = stbi_load(path.c_str(), &w, &h, &channels, 3);
+  LITERT_RETURN_IF_ERROR(
+      Require(data != nullptr, "Cannot decode image: " + path));
+  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> image(data,
+                                                             stbi_image_free);
+  return PreprocessRgb(image.get(), w, h, c, nchw);
+}
+}  // namespace litert::imagenet
